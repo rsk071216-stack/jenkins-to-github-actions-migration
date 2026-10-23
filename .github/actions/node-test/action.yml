@@ -1,0 +1,85 @@
+# Composite action: the GitHub Actions replacement for the legacy
+# shared library step legacy/shared-library/vars/nodeBuild.groovy.
+#
+# Steps-level reuse (setup + test + reports) belongs in a composite action;
+# job-level reuse (whole build/scan/sign pipeline) belongs in a reusable
+# workflow. See docs/concept-mapping.md.
+name: Node.js test with coverage
+description: Install a pinned Node.js, run the test suite with coverage gates, publish JUnit + LCOV reports.
+
+inputs:
+  node-version:
+    description: Exact Node.js version to install.
+    required: true
+  working-directory:
+    description: Directory that contains package.json.
+    required: false
+    default: app
+  artifact-name:
+    description: Name of the uploaded test-report artifact.
+    required: false
+    default: test-reports
+
+outputs:
+  line-coverage:
+    description: Line coverage percentage computed from lcov.info.
+    value: ${{ steps.coverage.outputs.lines }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js ${{ inputs.node-version }}
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        # Zero runtime dependencies today; `npm ci` would require a lockfile, so the
+        # step adapts and keeps the pipeline shape identical for repos that have one.
+        if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else echo "No dependencies to install."; fi
+
+    - name: Run tests with coverage thresholds
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: npm run test:ci
+
+    - name: Coverage summary
+      id: coverage
+      env:
+        NODE_VERSION: ${{ inputs.node-version }}
+      if: always()
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ ! -f reports/lcov.info ]; then
+          echo "No lcov report produced." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        awk -F: '
+          /^LF:/ { lf += $2 } /^LH:/ { lh += $2 }
+          /^BRF:/ { brf += $2 } /^BRH:/ { brh += $2 }
+          /^FNF:/ { fnf += $2 } /^FNH:/ { fnh += $2 }
+          END {
+            printf "lines=%.2f\nbranches=%.2f\nfunctions=%.2f\n", (lf ? lh * 100 / lf : 0), (brf ? brh * 100 / brf : 0), (fnf ? fnh * 100 / fnf : 0)
+          }' reports/lcov.info > coverage.env
+        cat coverage.env >> "$GITHUB_OUTPUT"
+        {
+          echo "### Coverage (Node.js ${NODE_VERSION})"
+          echo
+          echo "| Metric | Covered |"
+          echo "| --- | --- |"
+          sed -E 's/^([a-z]+)=(.*)$/| \1 | \2% |/' coverage.env
+        } >> "$GITHUB_STEP_SUMMARY"
+        rm coverage.env
+
+    - name: Upload test reports
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.working-directory }}/reports/
+        if-no-files-found: warn
+        retention-days: 14

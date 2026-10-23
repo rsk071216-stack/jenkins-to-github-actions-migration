@@ -1,0 +1,204 @@
+# Deploy: the GitHub Actions replacement for the Jenkinsfile stages
+# "Deploy Staging" -> "Approval" (input) -> "Deploy Production".
+#
+# This workflow is manual (workflow_dispatch) and is NOT expected to run in this
+# portfolio repository: there is no Azure subscription behind it. It is complete
+# and lint-checked (actionlint) so it can be adopted as-is. Setup steps are in
+# docs/environments-and-oidc.md.
+#
+# Security model:
+#   - No cloud secrets stored anywhere. azure/login exchanges the job's GitHub
+#     OIDC token for an Entra ID access token via a federated credential that
+#     trusts ONLY this repository + the named environment.
+#   - AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID are identifiers,
+#     not secrets, so they live in environment-scoped `vars`.
+#   - "staging" and "production" are GitHub Environments. Production has
+#     required reviewers (replaces Jenkins `input`), a wait timer, and a
+#     deployment branch policy of `main` only.
+#   - Every deploy first verifies the cosign signature and the SLSA provenance
+#     of the exact digest, so only images built by ci.yml on main can ship.
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: Image digest to deploy (sha256:...), from the ci run summary.
+        required: true
+        type: string
+      target:
+        description: How far to promote.
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  NAMESPACE: versioning
+  DEPLOYMENT: versioning-service
+
+jobs:
+  verify:
+    name: verify signature and provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    steps:
+      - name: Validate digest input
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::digest must look like sha256:<64 hex chars>"
+            exit 1
+          fi
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify keyless signature (must come from this repo's workflows on main)
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/.+@refs/heads/main$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          echo "Signature verified for ${IMAGE}@${DIGEST}"
+
+      - name: Verify SLSA build provenance
+        env:
+          DIGEST: ${{ inputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$GITHUB_REPOSITORY"
+
+  deploy-staging:
+    name: deploy to staging
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url: https://versioning.staging.example.com
+    permissions:
+      contents: read
+      id-token: write # OIDC federation to Azure; no stored credentials
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.34.1
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@883bdc8d8d1d0fd87e66cc4ba6f0b618f9eb5281 # v5.0.1
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+
+      - name: Deploy by digest and wait for rollout
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          # Render the image reference as an immutable digest, then apply once:
+          # a single rollout, and the manifest in the cluster matches what shipped.
+          kubectl apply -n "$NAMESPACE" -f deploy/k8s/service.yaml
+          sed -E "s#^( +image: ).*#\1${IMAGE}@${DIGEST}#" deploy/k8s/deployment.yaml \
+            | kubectl apply -n "$NAMESPACE" -f -
+          kubectl -n "$NAMESPACE" rollout status "deployment/${DEPLOYMENT}" --timeout=5m
+
+      - name: Automatic rollback on failure
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" rollout undo "deployment/${DEPLOYMENT}"
+          kubectl -n "$NAMESPACE" rollout status "deployment/${DEPLOYMENT}" --timeout=5m
+
+  deploy-production:
+    # Required reviewers on the "production" environment replace the Jenkins
+    # `input` step: the job waits WITHOUT holding a runner, and the approval is
+    # recorded in the deployment history with the approver's identity.
+    name: deploy to production
+    needs: deploy-staging
+    if: inputs.target == 'production'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: https://versioning.example.com
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.34.1
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@883bdc8d8d1d0fd87e66cc4ba6f0b618f9eb5281 # v5.0.1
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+
+      - name: Deploy by digest and wait for rollout
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          # Render the image reference as an immutable digest, then apply once:
+          # a single rollout, and the manifest in the cluster matches what shipped.
+          kubectl apply -n "$NAMESPACE" -f deploy/k8s/service.yaml
+          sed -E "s#^( +image: ).*#\1${IMAGE}@${DIGEST}#" deploy/k8s/deployment.yaml \
+            | kubectl apply -n "$NAMESPACE" -f -
+          kubectl -n "$NAMESPACE" rollout status "deployment/${DEPLOYMENT}" --timeout=5m
+
+      - name: Automatic rollback on failure
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" rollout undo "deployment/${DEPLOYMENT}"
+          kubectl -n "$NAMESPACE" rollout status "deployment/${DEPLOYMENT}" --timeout=5m
+
+      - name: Deployment record
+        env:
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          {
+            echo "### Production deployment"
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Image | \`${IMAGE}@${DIGEST}\` |"
+            echo "| Triggered by | ${GITHUB_ACTOR} |"
+            echo "| Approved via | GitHub Environment protection rules (see deployment history) |"
+          } >> "$GITHUB_STEP_SUMMARY"

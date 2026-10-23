@@ -1,0 +1,257 @@
+# CI: the GitHub Actions replacement for legacy/Jenkinsfile (build -> push stages).
+# Deployment lives in deploy.yml. Stage-by-stage mapping: docs/concept-mapping.md.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default. Jobs that publish opt in to more, on main only.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "22.23.3"
+
+jobs:
+  lint:
+    name: lint (code, Dockerfile, workflows)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      app-version: ${{ steps.version.outputs.app-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read application version
+        id: version
+        run: echo "app-version=$(jq -r .version app/package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Biome
+        uses: biomejs/setup-biome@4c91541eaada48f67d7dbd7833600ce162b68f51 # v2.7.1
+        with:
+          version: 2.5.15
+
+      - name: Lint and format check (Biome)
+        run: biome ci --reporter=github .
+
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: app/Dockerfile
+
+      - name: Lint workflows (actionlint + shellcheck)
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "$archive" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" actionlint
+          ./actionlint -color
+
+  test:
+    # Jenkins `parallel` / matrix axes -> GitHub Actions strategy.matrix.
+    # 22.x is the production runtime (same as the Docker base image); 24.x is the next LTS.
+    name: test (node ${{ matrix.node-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22.23.3", "24.21.0"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test with coverage (composite action, replaces vars/nodeBuild.groovy)
+        uses: ./.github/actions/node-test
+        with:
+          node-version: ${{ matrix.node-version }}
+          working-directory: app
+          artifact-name: test-reports-node-${{ matrix.node-version }}
+
+  legacy-validate:
+    name: validate legacy Jenkinsfile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GROOVY_VERSION: 4.0.28
+      GROOVY_SHA256: d77164a44ab994837e61eecead64721bdb1794fa2bc6704ac6fe70cd32ef9dd3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download Groovy compiler (checksum verified)
+        run: |
+          jar="groovy-${GROOVY_VERSION}.jar"
+          curl -fsSLo "$RUNNER_TEMP/$jar" "https://repo1.maven.org/maven2/org/apache/groovy/groovy/${GROOVY_VERSION}/${jar}"
+          echo "${GROOVY_SHA256}  $RUNNER_TEMP/$jar" | sha256sum --check --strict
+
+      - name: Groovy syntax check (Jenkinsfile + shared library)
+        run: |
+          java -cp "$RUNNER_TEMP/groovy-${GROOVY_VERSION}.jar" scripts/legacy/GroovyParseCheck.java \
+            legacy/Jenkinsfile legacy/shared-library/vars/*.groovy
+
+      - name: Structural checks (stages, pinning, extractable commands, no secrets)
+        run: bash scripts/legacy/validate-jenkinsfile.sh legacy/Jenkinsfile
+
+  parity:
+    # Signature job: proves the migrated pipeline produces equivalent outcomes to
+    # the Jenkins pipeline. See docs/adr/0005-parity-check.md.
+    name: parity (Jenkins vs GitHub Actions)
+    needs: [test, legacy-validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download GitHub Actions test reports (node ${{ env.NODE_VERSION }})
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-reports-node-${{ env.NODE_VERSION }}
+          path: parity/gha-reports
+
+      - name: Replay Jenkins "Unit Test" stage inside the Jenkins agent image
+        run: |
+          extract=scripts/legacy/jenkinsfile-extract.sh
+          image=$(bash "$extract" legacy/Jenkinsfile agent-image)
+          read -r -a agent_args <<< "$(bash "$extract" legacy/Jenkinsfile agent-args)"
+          stage_dir=$(bash "$extract" legacy/Jenkinsfile stage-dir "Unit Test")
+          stage_cmd=$(bash "$extract" legacy/Jenkinsfile stage-sh "Unit Test")
+          echo "Agent image : ${image}"
+          echo "Agent args  : ${agent_args[*]}"
+          echo "Command     : (cd ${stage_dir} && ${stage_cmd})"
+          rm -rf app/reports
+          # Same as the docker-workflow plugin: workspace mounted, non-root uid.
+          docker run --rm --user "$(id -u):$(id -g)" "${agent_args[@]}" \
+            --volume "${GITHUB_WORKSPACE}:/workspace" --workdir "/workspace/${stage_dir}" \
+            "$image" sh -c "$stage_cmd"
+          mkdir -p parity/legacy-reports
+          cp app/reports/junit.xml parity/legacy-reports/junit.xml
+
+      - name: Compare test outcomes
+        run: |
+          bash scripts/parity/compare-tests.sh \
+            parity/legacy-reports/junit.xml parity/gha-reports/junit.xml parity/report.md
+
+      - name: Replay Jenkins "Docker Build" stage (plain docker build, default builder)
+        env:
+          IMAGE: legacy.local/versioning-service
+          IMAGE_TAG: parity
+        run: |
+          stage_cmd=$(bash scripts/legacy/jenkinsfile-extract.sh legacy/Jenkinsfile stage-sh "Docker Build")
+          APP_VERSION=$(jq -r .version app/package.json)
+          GIT_SHA="$GITHUB_SHA"
+          export APP_VERSION GIT_SHA
+          echo "Command: ${stage_cmd}"
+          bash -c "$stage_cmd"
+
+      # Buildx is set up only now so the step above really used the classic
+      # `docker build` path that the Jenkins agent uses.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Read build arguments
+        id: args
+        run: echo "app-version=$(jq -r .version app/package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build with the GitHub Actions path (Buildx + GHA cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          build-args: |
+            APP_VERSION=${{ steps.args.outputs.app-version }}
+            GIT_SHA=${{ github.sha }}
+          tags: gha.local/versioning-service:parity
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=parity
+          cache-to: type=gha,scope=parity,mode=max
+
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+
+      - name: Compare images (runtime config, layers, SBOM packages)
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          bash scripts/parity/compare-images.sh \
+            legacy.local/versioning-service:parity gha.local/versioning-service:parity \
+            parity/report.md "$SYFT"
+
+      - name: Publish parity report
+        if: always()
+        run: |
+          if [ -f parity/report.md ]; then cat parity/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload parity evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: parity-report
+          path: parity/
+          retention-days: 30
+
+  image-pr:
+    # Pull requests and branches: build + SBOM + vulnerability gate, read-only token.
+    name: image (build and scan)
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    needs: [lint, test]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-container-build.yml
+    with:
+      image-name: ${{ github.repository }}
+      context: app
+      build-args: |
+        APP_VERSION=${{ needs.lint.outputs.app-version }}
+        GIT_SHA=${{ github.sha }}
+      push: false
+
+  image-publish:
+    # main only: push to GHCR with GITHUB_TOKEN, keyless sign, attest SBOM + provenance.
+    name: image (publish, sign, attest)
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: [lint, test, parity]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    uses: ./.github/workflows/reusable-container-build.yml
+    with:
+      image-name: ${{ github.repository }}
+      context: app
+      build-args: |
+        APP_VERSION=${{ needs.lint.outputs.app-version }}
+        GIT_SHA=${{ github.sha }}
+      push: true

@@ -1,0 +1,19 @@
+# Plugins installed on the legacy controller to run this ONE pipeline.
+# Each line is a dependency to patch, test and upgrade - and a potential CVE.
+# Format: plugin-id:version (as exported by `jenkins-plugin-cli --list`).
+# Versions are illustrative of a typical estate that has fallen behind.
+workflow-aggregator:600.vb_57cdd26fdd7
+pipeline-model-definition:2.2214.vb_b_34b_2ea_9b_83
+docker-workflow:580.vc0c340686b_54
+credentials-binding:681.vf91669a_32e45
+pipeline-utility-steps:2.17.0
+sonar:2.17.2
+junit:1265.v65b_14fa_f12f0
+timestamper:1.27
+ansicolor:1.0.4
+slack:722.vd07f1ea_7ff40
+kubernetes-cli:1.12.1
+azure-credentials:299.v13a_e2d0b_7a_8b_
+git:5.2.1
+ws-cleanup:0.45
+# ...plus roughly 90 transitive dependencies.

@@ -1,0 +1,4 @@
+# Keep the build context minimal and deterministic: only what the runtime needs.
+*
+!package.json
+!src/

@@ -1,0 +1,23 @@
+# Node
+node_modules/
+app/reports/
+coverage/
+*.log
+
+# Local build and parity outputs
+/parity/
+sbom*.json
+trivy-results.sarif
+actionlint
+actionlint_*.tar.gz
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Never commit credentials
+.env
+*.pem
+*.key

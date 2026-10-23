@@ -1,0 +1,17 @@
+{
+  "name": "versioning-service",
+  "version": "1.4.0",
+  "description": "Tiny REST API that calculates and compares semantic versions. Demo workload for the Jenkins to GitHub Actions migration.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:ci": "mkdir -p reports && node --test --experimental-test-coverage --test-coverage-lines=90 --test-coverage-branches=80 --test-coverage-functions=90 --test-coverage-include=\"src/**\" --test-coverage-exclude=\"src/server.js\" --test-coverage-exclude=\"src/healthcheck.js\" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=reports/junit.xml --test-reporter=lcov --test-reporter-destination=reports/lcov.info \"test/**/*.test.js\""
+  }
+}

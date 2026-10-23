@@ -1,0 +1,64 @@
+# Applied by .github/workflows/deploy.yml, which rewrites the image line to an
+# immutable digest (image@sha256:...) before `kubectl apply`. The tag below is
+# only a placeholder for local experiments.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: versioning-service
+  labels:
+    app.kubernetes.io/name: versioning-service
+    app.kubernetes.io/part-of: jenkins-to-github-actions-migration
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: versioning-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: versioning-service
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: app
+          image: ghcr.io/rsk071216-stack/jenkins-to-github-actions-migration:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,194 @@
+// =============================================================================
+// LEGACY PIPELINE (the "before" state) - versioning-service
+// =============================================================================
+// This is a faithful reproduction of the kind of Jenkinsfile found in most
+// enterprise Jenkins estates I have worked on. It works, and that is the
+// problem: it works only on one specific controller, with one specific set of
+// plugins, credentials and hand-built agents.
+//
+// Annotations tagged [PROBLEM] are the findings that the migration removes.
+// The GitHub Actions equivalent lives in .github/workflows/ci.yml and deploy.yml.
+//
+// Required plugins (see legacy/plugins.txt for the full sprawl):
+//   workflow-aggregator, docker-workflow, sonar, credentials-binding,
+//   pipeline-utility-steps, junit, timestamper, ansicolor, slack, kubernetes-cli
+// =============================================================================
+
+// [PROBLEM] Shared library loaded at a moving branch on a separate repo.
+// A change on 'master' of the library silently changes every pipeline.
+library 'acme-ci-lib@master'
+
+pipeline {
+    // [PROBLEM] Build/test agent is a Docker container on a "docker" labelled
+    // VM that somebody built by hand in 2019. Nobody knows exactly what is on it.
+    agent {
+        docker {
+            image 'node:22.23.3-bookworm-slim'
+            label 'docker'
+            args '-e HOME=/tmp -e NPM_CONFIG_UPDATE_NOTIFIER=false'
+        }
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        booleanParam(name: 'SKIP_SONAR', defaultValue: false, description: 'Emergency switch (used far too often)')
+    }
+
+    triggers {
+        // [PROBLEM] SCM polling instead of webhooks: load on the controller and
+        // up to 5 minutes of extra lead time on every change.
+        pollSCM('H/5 * * * *')
+        cron('H 2 * * 1-5')
+    }
+
+    environment {
+        APP_NAME     = 'versioning-service'
+        // [PROBLEM] Registry hostname and credential IDs are hard-coded per
+        // controller. Moving the job to another controller breaks it.
+        REGISTRY     = 'acmeprod.azurecr.io'
+        IMAGE        = "${REGISTRY}/${APP_NAME}"
+        // [PROBLEM] Long-lived service principal secret stored in Jenkins.
+        // Rotated manually "every 90 days" (last rotation: unknown).
+        AZURE_SP     = credentials('azure-sp-prod')
+        SONAR_TOKEN  = credentials('sonar-token')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHA     = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                    env.SHORT_SHA   = env.GIT_SHA.take(7)
+                    env.APP_VERSION = readJSON(file: 'app/package.json').version
+                    env.IMAGE_TAG   = "${env.BUILD_NUMBER}-${env.SHORT_SHA}"
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                dir('app') {
+                    // Zero dependencies today, but the stage is kept so the
+                    // structure matches the many Maven/npm jobs in the estate.
+                    sh 'npm install --no-audit --no-fund'
+                }
+            }
+        }
+
+        stage('Unit Test') {
+            steps {
+                dir('app') {
+                    sh 'npm run test:ci'
+                }
+            }
+            post {
+                always {
+                    junit 'app/reports/junit.xml'
+                    // [PROBLEM] Coverage needs yet another plugin (cobertura /
+                    // coverage) with its own CVE history.
+                    archiveArtifacts artifacts: 'app/reports/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            when { expression { !params.SKIP_SONAR } }
+            steps {
+                withSonarQubeEnv('sonarqube-prod') {
+                    sh 'npx --yes sonar-scanner -Dsonar.projectKey=versioning-service -Dsonar.sources=app/src -Dsonar.tests=app/test -Dsonar.javascript.lcov.reportPaths=app/reports/lcov.info'
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            when { expression { !params.SKIP_SONAR } }
+            steps {
+                // [PROBLEM] Blocks an executor while waiting for a webhook that
+                // is frequently misconfigured after SonarQube upgrades.
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            // [PROBLEM] Runs on the raw VM with the Docker socket. Any job on
+            // this agent can read every other job's images and credentials.
+            agent { label 'docker' }
+            steps {
+                sh 'docker build --pull --build-arg APP_VERSION="${APP_VERSION}" --build-arg GIT_SHA="${GIT_SHA}" -t "${IMAGE}:${IMAGE_TAG}" app'
+            }
+        }
+
+        stage('Trivy Scan') {
+            agent { label 'docker' }
+            steps {
+                // [PROBLEM] Trivy binary version is whatever was installed on the
+                // agent; results differ between agents.
+                sh 'trivy image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 "${IMAGE}:${IMAGE_TAG}"'
+            }
+        }
+
+        stage('Push') {
+            when { branch 'main' }
+            agent { label 'docker' }
+            steps {
+                // [PROBLEM] Static registry password in the Jenkins credential
+                // store; leaked once via a "set -x" in a debug session.
+                withCredentials([usernamePassword(credentialsId: 'acr-push', usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+                    sh 'echo "$REG_PASS" | docker login "$REGISTRY" -u "$REG_USER" --password-stdin'
+                    sh 'docker push "${IMAGE}:${IMAGE_TAG}"'
+                }
+                // [PROBLEM] No SBOM, no signature, no provenance. Production
+                // cannot prove this image came from this pipeline.
+            }
+        }
+
+        stage('Deploy Staging') {
+            when { branch 'main' }
+            steps {
+                deployToAks(environment: 'staging', image: "${IMAGE}:${IMAGE_TAG}", credentialsId: 'azure-sp-prod')
+            }
+        }
+
+        stage('Approval') {
+            when { branch 'main' }
+            // [PROBLEM] input inside a stage holds the agent/executor while a
+            // human decides. Approver list is a free-text string, not audited.
+            agent none
+            steps {
+                timeout(time: 2, unit: 'HOURS') {
+                    input message: 'Deploy versioning-service to PRODUCTION?', ok: 'Deploy', submitter: 'release-managers'
+                }
+            }
+        }
+
+        stage('Deploy Production') {
+            when { branch 'main' }
+            steps {
+                deployToAks(environment: 'production', image: "${IMAGE}:${IMAGE_TAG}", credentialsId: 'azure-sp-prod')
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        failure {
+            // [PROBLEM] Slack plugin + token credential just for notifications.
+            slackSend channel: '#ci-alerts', color: 'danger', message: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.BUILD_URL})"
+        }
+        success {
+            echo "Built ${env.IMAGE}:${env.IMAGE_TAG}"
+        }
+    }
+}
